@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: english-mcq-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: CORS_ORIGIN
+        value: https://your-frontend-domain.vercel.app
