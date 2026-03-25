@@ -2,3 +2,6 @@ Flask
 Flask-Cors
 reportlab
 gunicorn
+openpyxl
+bcrypt
+python-dotenv

@@ -10,6 +10,7 @@ import AdminForgotPasswordPage from './pages/auth/AdminForgotPasswordPage'
 import AdminChangePasswordPage from './pages/auth/AdminChangePasswordPage'
 import AdminLoginPage from './pages/auth/AdminLoginPage'
 import AdminRegisterPage from './pages/auth/AdminRegisterPage'
+import AdminMasterPage from './pages/AdminMasterPage'
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
           <Route path="/admin" element={<AdminDashboardPage />} />
           <Route path="/admin/create-test" element={<CreateTestPage />} />
           <Route path="/admin/change-password" element={<AdminChangePasswordPage />} />
+          <Route path="/admin/master" element={<AdminMasterPage />} />
           <Route path="/admin/tests/:testId/results" element={<ResultsPage />} />
         </Route>
       </Route>

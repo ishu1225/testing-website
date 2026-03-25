@@ -1,5 +1,7 @@
 import csv
 import hashlib
+import bcrypt
+import smtplib
 import io
 import json
 import os
@@ -7,17 +9,22 @@ import re
 import secrets
 import sqlite3
 import time
+import textwrap
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
+import openpyxl
+from email.mime.text import MIMEText
 from flask import Flask, g, jsonify, make_response, request, send_file
 from flask_cors import CORS
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from dotenv import load_dotenv
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 DB_PATH = os.path.join(BASE_DIR, "database.db")
 
 app = Flask(__name__)
@@ -31,8 +38,120 @@ def get_db_connection():
     return conn
 
 
-def hash_password(password):
+def sha256_hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def normalize_answer_text(value):
+    # Security answers are compared case-insensitively.
+    # We normalize to lowercase + trim before hashing/comparing.
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+def normalize_birth_date(value):
+    """
+    Expect DOB in strict calendar order as YYYY-MM-DD (from <input type="date">).
+    We validate and normalize to the exact same string format.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    # Strict YYYY-MM-DD
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+        return ""
+    return v
+
+def hash_security_answer(normalized_value):
+    # Store only hashes of normalized answers.
+    return sha256_hash_password(normalized_value)
+
+
+def hash_password(password):
+    # bcrypt hashes include salt; verify must use checkpw.
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password, stored_hash):
+    if not stored_hash:
+        return False
+    # bcrypt hashes start with $2b$ / $2a$ / $2y$
+    if str(stored_hash).startswith("$2"):
+        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+    # Backward compatibility: older admins stored sha256
+    return sha256_hash_password(password) == stored_hash
+
+
+def otp_code(length=6):
+    # Generates a numeric OTP like 123456
+    return "".join(str(secrets.randbelow(10)) for _ in range(length))
+
+
+def otp_expires_utc(minutes=10):
+    return (datetime.utcnow() + timedelta(minutes=minutes)).replace(microsecond=0).isoformat() + "Z"
+
+
+def session_expires_utc(hours=8):
+    return (datetime.utcnow() + timedelta(hours=hours)).replace(microsecond=0).isoformat() + "Z"
+
+
+def otp_rate_limited(email, purpose, min_interval_seconds=60, max_requests=5, window_minutes=60):
+    """
+    Simple per-email/per-purpose OTP rate limit using SQLite timestamps.
+    - min_interval_seconds: minimum seconds between consecutive OTP requests
+    - max_requests: maximum OTPs allowed within window_minutes
+    """
+    email = (email or "").strip().lower()
+    purpose = (purpose or "").strip().lower()
+    if not email or not purpose:
+        return False
+
+    now = datetime.utcnow().replace(microsecond=0)
+    window_start = (now - timedelta(minutes=window_minutes)).replace(microsecond=0)
+    window_start_iso = window_start.isoformat() + "Z"
+
+    with closing(get_db_connection()) as conn:
+        last = conn.execute(
+            "SELECT requested_at FROM otp_request_log WHERE email = ? AND purpose = ? ORDER BY requested_at DESC LIMIT 1",
+            (email, purpose),
+        ).fetchone()
+        if last:
+            last_dt = parse_iso_datetime(last["requested_at"])
+            if last_dt and (now - last_dt) < timedelta(seconds=min_interval_seconds):
+                return True
+
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM otp_request_log WHERE email = ? AND purpose = ? AND requested_at >= ?",
+            (email, purpose, window_start_iso),
+        ).fetchone()
+        count = int(row["c"]) if row else 0
+        return count >= int(max_requests)
+
+
+def send_email_otp(to_email, subject, body):
+    """
+    Sends OTP using Gmail SMTP (or any SMTP).
+    Requires env vars:
+      SMTP_HOST, SMTP_PORT, SMTP_EMAIL, SMTP_PASSWORD, SMTP_USE_TLS
+    """
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
+    smtp_email = os.getenv("SMTP_EMAIL", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+    smtp_use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes"}
+
+    if not smtp_host or not smtp_email or not smtp_password:
+        raise RuntimeError("SMTP is not configured (set SMTP_HOST/SMTP_EMAIL/SMTP_PASSWORD).")
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp_email
+    msg["To"] = to_email
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        if smtp_use_tls:
+            server.starttls()
+        server.login(smtp_email, smtp_password)
+        server.sendmail(smtp_email, [to_email], msg.as_string())
 
 
 def migrate_if_needed(conn):
@@ -42,8 +161,49 @@ def migrate_if_needed(conn):
     if "expires_at" not in test_cols:
         conn.execute("ALTER TABLE tests ADD COLUMN expires_at TEXT")
 
+    admin_cols = [row["name"] for row in conn.execute("PRAGMA table_info(admins)").fetchall()]
+    if "is_verified" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0")
+    if "verification_code" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN verification_code TEXT")
+    if "verification_expires_at" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN verification_expires_at TEXT")
+    if "reset_code" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN reset_code TEXT")
+    if "reset_expires_at" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN reset_expires_at TEXT")
+
+    # Security answers for password reset: DOB + city + school.
+    # Stored as hashes (after normalization) for safer comparison.
+    if "dob_answer_hash" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN dob_answer_hash TEXT")
+    if "birth_city_answer_hash" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN birth_city_answer_hash TEXT")
+    if "school_name_answer_hash" not in admin_cols:
+        conn.execute("ALTER TABLE admins ADD COLUMN school_name_answer_hash TEXT")
+
+    # Admin session expiry
+    admin_session_cols = [row["name"] for row in conn.execute("PRAGMA table_info(admin_sessions)").fetchall()]
+    if "expires_at" not in admin_session_cols:
+        conn.execute("ALTER TABLE admin_sessions ADD COLUMN expires_at TEXT")
+
+    # OTP abuse prevention (rate limiting per email+purpose)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS otp_request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            requested_at TEXT NOT NULL
+        )
+        """
+    )
+
 
 def init_db():
+    MASTER_ADMIN_USER_ID = "ISHU"
+    MASTER_ADMIN_PASSWORD = "240204"
+
     with closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -53,6 +213,14 @@ def init_db():
                 user_id TEXT NOT NULL UNIQUE,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
+                is_verified INTEGER NOT NULL DEFAULT 0,
+                verification_code TEXT,
+                verification_expires_at TEXT,
+                reset_code TEXT,
+                reset_expires_at TEXT,
+                dob_answer_hash TEXT,
+                birth_city_answer_hash TEXT,
+                school_name_answer_hash TEXT,
                 created_at TEXT NOT NULL
             );
             """
@@ -109,53 +277,194 @@ def init_db():
                 admin_id INTEGER NOT NULL,
                 token TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
+                expires_at TEXT,
                 FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
             );
             """
         )
         migrate_if_needed(conn)
+
+        # Ensure master admin always exists.
+        # Master admin bypasses security-answers checks; password-only.
+        master = conn.execute(
+            "SELECT id FROM admins WHERE user_id = ?",
+            (MASTER_ADMIN_USER_ID,),
+        ).fetchone()
+        if not master:
+            placeholder_email = f"{MASTER_ADMIN_USER_ID}@local.test"
+            conn.execute(
+                """
+                INSERT INTO admins (
+                    user_id,
+                    email,
+                    password_hash,
+                    is_verified,
+                    dob_answer_hash,
+                    birth_city_answer_hash,
+                    school_name_answer_hash,
+                    created_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    MASTER_ADMIN_USER_ID,
+                    placeholder_email,
+                    hash_password(MASTER_ADMIN_PASSWORD),
+                    hash_security_answer("master-dob"),
+                    hash_security_answer("master-city"),
+                    hash_security_answer("master-school"),
+                    now_utc_iso(),
+                ),
+            )
+            conn.commit()
+
         conn.commit()
 
 
 def parse_questions(raw_text):
-    blocks = re.split(r"\n\s*\n", raw_text.strip())
+    """
+    Parses MCQ text in flexible formats.
+
+    Supported:
+    - Question can be labeled as `Q1.`, `Q1)` or not labeled at all.
+    - Options can be labeled as:
+      - Letters: A-D (e.g. `A. foo`, `B) bar`)
+      - Numbers: 1-4 (e.g. `1. foo`, `2) bar`)
+      - Roman: I-IV (e.g. `I. foo`, `II) bar`)
+    - Answer can be:
+      - `Answer: B`, `Answer - 2`, `Correct Answer: IV`, `Ans: (A)`
+    - "Fill in the blanks (enter)" lines are ignored.
+    - Option lines can span multiple lines; non-option lines after an option
+      are appended to the last option text.
+    """
+    raw = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+
+    def normalize_space(s):
+        return re.sub(r"\s+", " ", s or "").strip()
+
+    def map_label_to_option(label_raw):
+        if label_raw is None:
+            return None
+        label = normalize_space(str(label_raw)).upper()
+
+        # Letters
+        if label in {"A", "B", "C", "D"}:
+            return label
+
+        # Numbers
+        if label in {"1", "2", "3", "4"}:
+            return {"1": "A", "2": "B", "3": "C", "4": "D"}[label]
+
+        # Roman numerals (I-IV)
+        roman_map = {"I": "A", "II": "B", "III": "C", "IV": "D"}
+        if label in roman_map:
+            return roman_map[label]
+
+        return None
+
+    def extract_answer_token(line):
+        # Remove leading marker words, then try to capture the first option-like token.
+        candidate = re.sub(r"^(Answer|Ans|Correct Answer|Correct)\s*[:\-\)]\s*", "", line, flags=re.IGNORECASE).strip()
+        candidate = candidate.strip("()[]{} ").strip()
+        # Token could be like "B", "2", "II", "Option B"
+        m = re.search(r"\b([A-Da-d]|[1-4]|IV|III|II|I)\b", candidate)
+        if not m:
+            return None
+        return m.group(1)
+
+    # Option line patterns:
+    #   A. text | A) text | (A) text | 1. text | I. text
+    option_line_re = re.compile(
+        r"^\s*(?:Option\s*)?(?:\(?\s*)?(?P<label>[A-Da-d]|[1-4]|IV|III|II|I)\s*(?:\)?\s*)*(?:[\.\):\-])\s*(?P<text>.+?)\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    question_prefix_re = re.compile(
+        r"^\s*(?:Q\s*|QUESTION\s*)?\s*\d+\s*[\.\)\:\-]\s*",
+        flags=re.IGNORECASE,
+    )
+
+    lines = [normalize_space(l) for l in raw.split("\n")]
+    # Keep empty lines out to simplify scanner.
+    lines = [l for l in lines if l]
+
     parsed = []
+    question_lines = []
+    options = {"A": "", "B": "", "C": "", "D": ""}
+    correct_answer = None
+    in_options = False
+    last_option_key = None
 
-    for block in blocks:
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if len(lines) < 6:
-            continue
+    def finalize_current():
+        nonlocal question_lines, options, correct_answer, in_options, last_option_key
+        qtext = normalize_space(" ".join(question_lines))
+        if not qtext or not correct_answer:
+            question_lines = []
+            options = {"A": "", "B": "", "C": "", "D": ""}
+            correct_answer = None
+            in_options = False
+            last_option_key = None
+            return
 
-        q_match = re.match(r"^Q\d+[\.\)]\s*(.+)$", lines[0], re.IGNORECASE)
-        if not q_match:
-            continue
+        # Ensure all options exist (DB requires NOT NULL).
+        # If missing, keep empty strings.
+        parsed.append(
+            {
+                "question_text": qtext,
+                "option_a": options.get("A", "") or "",
+                "option_b": options.get("B", "") or "",
+                "option_c": options.get("C", "") or "",
+                "option_d": options.get("D", "") or "",
+                "correct_answer": correct_answer,
+            }
+        )
 
-        question_text = q_match.group(1).strip()
+        question_lines = []
         options = {"A": "", "B": "", "C": "", "D": ""}
-        answer = ""
+        correct_answer = None
+        in_options = False
+        last_option_key = None
 
-        for line in lines[1:]:
-            opt_match = re.match(r"^([ABCD])[\.\)]\s*(.+)$", line, re.IGNORECASE)
-            if opt_match:
-                options[opt_match.group(1).upper()] = opt_match.group(2).strip()
-                continue
+    for line in lines:
+        # Ignore "Fill in the blanks (enter)" style helper lines.
+        # (Only ignore if it's basically just that helper text.)
+        if re.match(r"^\s*fill\s*in\s*the\s*blanks\s*(\(.+?\))?\s*$", line, flags=re.IGNORECASE):
+            continue
 
-            ans_match = re.match(r"^Answer\s*:\s*([ABCD])$", line, re.IGNORECASE)
-            if ans_match:
-                answer = ans_match.group(1).upper()
+        # Answer line
+        ans_token = extract_answer_token(line) if re.match(r"^(Answer|Ans|Correct|Correct Answer)\b", line, flags=re.IGNORECASE) else None
+        if ans_token:
+            mapped = map_label_to_option(ans_token)
+            if mapped:
+                correct_answer = mapped
+                finalize_current()
+            continue
 
-        if all(options.values()) and answer in options:
-            parsed.append(
-                {
-                    "question_text": question_text,
-                    "option_a": options["A"],
-                    "option_b": options["B"],
-                    "option_c": options["C"],
-                    "option_d": options["D"],
-                    "correct_answer": answer,
-                }
-            )
+        # Option line
+        opt_match = option_line_re.match(line)
+        if opt_match:
+            label = opt_match.group("label")
+            text = normalize_space(opt_match.group("text"))
+            mapped = map_label_to_option(label)
+            if mapped:
+                options[mapped] = text
+                in_options = True
+                last_option_key = mapped
+            continue
 
+        # If we are in options, allow multiline option continuation.
+        if in_options and last_option_key:
+            options[last_option_key] = normalize_space(f"{options[last_option_key]} {line}")
+            continue
+
+        # Question line
+        # Remove leading prefixes like "Q1.", "1)" etc if present.
+        cleaned = question_prefix_re.sub("", line).strip()
+        if cleaned:
+            question_lines.append(cleaned)
+
+    # In case the last block has no Answer line, ignore (needs correct answer).
     return parsed
 
 
@@ -199,13 +508,32 @@ def get_admin_from_token():
     with closing(get_db_connection()) as conn:
         row = conn.execute(
             """
-            SELECT a.id, a.user_id, a.email
+            SELECT a.id, a.user_id, a.email, s.expires_at, s.created_at
             FROM admin_sessions s
             JOIN admins a ON a.id = s.admin_id
             WHERE s.token = ?
             """,
             (token,),
         ).fetchone()
+    if not row:
+        return None
+
+    # Token expiry hardening
+    expires_at = row["expires_at"]
+    if expires_at:
+        expires_dt = parse_iso_datetime(expires_at)
+    else:
+        # Backward compatibility for older sessions: treat as expired after 8h.
+        created_dt = parse_iso_datetime(row["created_at"])
+        expires_dt = created_dt + timedelta(hours=8) if created_dt else None
+
+    if expires_dt and expires_dt <= datetime.utcnow():
+        # Best-effort cleanup
+        with closing(get_db_connection()) as conn2:
+            conn2.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
+            conn2.commit()
+        return None
+
     return row
 
 
@@ -232,48 +560,109 @@ def admin_register():
     user_id = (data.get("userId") or "").strip()
     email = (data.get("email") or "").strip().lower()
     password = (data.get("password") or "").strip()
+    dob = normalize_birth_date(data.get("dob"))
+    birth_city = normalize_answer_text(data.get("birthCity"))
+    school_name = normalize_answer_text(data.get("schoolName"))
 
-    if not user_id or not email or not password:
-        return jsonify({"error": "User ID, email and password are required"}), 400
+    if not user_id:
+        return jsonify({"error": "User ID is required"}), 400
+
+    # Simple mode: no OTP/email verification. Use a deterministic dummy email.
+    if not email or "@" not in email:
+        email = f"{user_id}@local.test"
+
+    if not password:
+        return jsonify({"error": "Password is required"}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    if not dob:
+        return jsonify({"error": "DOB is required and must be in YYYY-MM-DD format"}), 400
+    if not birth_city:
+        return jsonify({"error": "City of birth is required"}), 400
+    if not school_name:
+        return jsonify({"error": "Name of school is required"}), 400
+
+    dob_hash = hash_security_answer(dob)
+    birth_city_hash = hash_security_answer(birth_city)
+    school_name_hash = hash_security_answer(school_name)
 
     try:
         with closing(get_db_connection()) as conn:
             conn.execute(
                 """
-                INSERT INTO admins (user_id, email, password_hash, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO admins (
+                    user_id, email, password_hash, is_verified,
+                    verification_code, verification_expires_at,
+                    reset_code, reset_expires_at,
+                    dob_answer_hash, birth_city_answer_hash, school_name_answer_hash,
+                    created_at
+                )
+                VALUES (?, ?, ?, 1, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
-                (user_id, email, hash_password(password), now_utc_iso()),
+                (
+                    user_id,
+                    email,
+                    hash_password(password),
+                    dob_hash,
+                    birth_city_hash,
+                    school_name_hash,
+                    now_utc_iso(),
+                ),
             )
             conn.commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "User ID or email already exists"}), 409
 
-    return jsonify({"message": "Admin account created"})
+    return jsonify({"message": "Admin account created."})
+
+
+@app.post("/api/admin/verify-email")
+def admin_verify_email():
+    return jsonify({"error": "Email/OTP verification is disabled in simple mode."}), 410
 
 
 @app.post("/api/admin/login")
 def admin_login():
     data = request.get_json(force=True)
-    user_id = (data.get("userId") or "").strip()
+    identifier = (data.get("userId") or data.get("identifier") or "").strip()
     password = (data.get("password") or "").strip()
-    if not user_id or not password:
-        return jsonify({"error": "User ID and password are required"}), 400
+    if not identifier:
+        return jsonify({"error": "User ID is required"}), 400
+
+    identifier_is_email = "@" in identifier
+    user_id = identifier if not identifier_is_email else identifier.split("@", 1)[0]
+    email = identifier.lower() if identifier_is_email else f"{user_id}@local.test"
 
     with closing(get_db_connection()) as conn:
         admin = conn.execute(
-            "SELECT id, user_id, email, password_hash FROM admins WHERE user_id = ?",
+            "SELECT id, user_id, email, password_hash, dob_answer_hash, birth_city_answer_hash, school_name_answer_hash FROM admins WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        if not admin or admin["password_hash"] != hash_password(password):
-            return jsonify({"error": "Invalid credentials"}), 401
+
+        if not admin:
+            return jsonify({"error": "Admin account not found"}), 404
+
+        MASTER_ADMIN_USER_ID = "ISHU"
+        MASTER_ADMIN_PASSWORD = "240204"
+
+        # Master admin bypass: password-only.
+        if admin["user_id"] == MASTER_ADMIN_USER_ID:
+            if not password:
+                return jsonify({"error": "Password is required"}), 400
+            if not verify_password(password, admin["password_hash"]):
+                return jsonify({"error": "Invalid credentials"}), 401
+        else:
+            # Normal admin login: password only.
+            if not password:
+                return jsonify({"error": "Password is required"}), 400
+            if not verify_password(password, admin["password_hash"]):
+                return jsonify({"error": "Invalid credentials"}), 401
 
         token = secrets.token_urlsafe(32)
         conn.execute(
-            "INSERT INTO admin_sessions (admin_id, token, created_at) VALUES (?, ?, ?)",
-            (admin["id"], token, now_utc_iso()),
+            "INSERT INTO admin_sessions (admin_id, token, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (admin["id"], token, now_utc_iso(), session_expires_utc(hours=8)),
         )
         conn.commit()
 
@@ -287,29 +676,205 @@ def admin_login():
 
 @app.post("/api/admin/forgot-password")
 def admin_forgot_password():
+    return jsonify({"error": "Use /forgot-password/request-otp after answering security questions."}), 400
+
+
+@app.post("/api/admin/forgot-password/request-otp")
+def admin_forgot_password_request_otp():
     data = request.get_json(force=True)
-    user_id = (data.get("userId") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    new_password = (data.get("newPassword") or "").strip()
-    if not user_id or not email or not new_password:
-        return jsonify({"error": "User ID, linked email and new password are required"}), 400
-    if len(new_password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    identifier = (data.get("userId") or data.get("identifier") or "").strip()
+    dob = normalize_birth_date(data.get("dob"))
+    birth_city = normalize_answer_text(data.get("birthCity"))
+    school_name = normalize_answer_text(data.get("schoolName"))
+
+    if not identifier:
+        return jsonify({"error": "User ID is required"}), 400
+
+    identifier_is_email = "@" in identifier
+    user_id = identifier if not identifier_is_email else identifier.split("@", 1)[0]
 
     with closing(get_db_connection()) as conn:
-        updated = conn.execute(
+        admin = conn.execute(
+            """
+            SELECT id, user_id, email, dob_answer_hash, birth_city_answer_hash, school_name_answer_hash
+            FROM admins
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+        if not admin:
+            return jsonify({"error": "Admin account not found"}), 404
+
+        # Master admin bypass: password reset can be triggered without security answers.
+        if admin["user_id"] != "ISHU":
+            if not dob or not birth_city or not school_name:
+                return jsonify({"error": "DOB, city of birth, and school name are required"}), 400
+            if not (admin["dob_answer_hash"] and admin["birth_city_answer_hash"] and admin["school_name_answer_hash"]):
+                return jsonify({"error": "Security answers not set for this account"}), 403
+
+            if (
+                hash_security_answer(dob) != admin["dob_answer_hash"]
+                or hash_security_answer(birth_city) != admin["birth_city_answer_hash"]
+                or hash_security_answer(school_name) != admin["school_name_answer_hash"]
+            ):
+                return jsonify({"error": "Security answers do not match"}), 401
+
+        if otp_rate_limited(admin["email"], purpose="forgot-password-request"):
+            return jsonify({"error": "Too many OTP requests. Please wait and try again."}), 429
+
+        otp = otp_code(6)
+        expires_at = otp_expires_utc(minutes=10)
+
+        conn.execute(
             """
             UPDATE admins
-            SET password_hash = ?
-            WHERE user_id = ? AND email = ?
+            SET reset_code = ?, reset_expires_at = ?
+            WHERE id = ?
             """,
-            (hash_password(new_password), user_id, email),
+            (otp, expires_at, admin["id"]),
         )
         conn.commit()
-        if updated.rowcount == 0:
-            return jsonify({"error": "User ID and linked email do not match"}), 404
 
-    return jsonify({"message": "Password reset successful"})
+        smtp_dev_return = os.getenv("DEV_RETURN_OTP", "false").strip().lower() in {"1", "true", "yes"}
+        if smtp_dev_return:
+            return jsonify({"message": "OTP generated (dev mode).", "otp": otp})
+
+        send_email_otp(
+            to_email=admin["email"],
+            subject="Admin password reset OTP",
+            body=f"Your OTP code is: {otp}\nThis OTP expires in 10 minutes.",
+        )
+        return jsonify({"message": "OTP sent to your email address."})
+
+
+@app.post("/api/admin/forgot-password/confirm-otp")
+def admin_forgot_password_confirm_otp():
+    data = request.get_json(force=True)
+    identifier = (data.get("userId") or data.get("identifier") or "").strip()
+    otp = (data.get("otp") or data.get("code") or "").strip()
+    new_password = (data.get("newPassword") or "").strip()
+
+    if not identifier:
+        return jsonify({"error": "User ID is required"}), 400
+    if not otp:
+        return jsonify({"error": "OTP code is required"}), 400
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
+
+    identifier_is_email = "@" in identifier
+    user_id = identifier if not identifier_is_email else identifier.split("@", 1)[0]
+
+    with closing(get_db_connection()) as conn:
+        admin = conn.execute(
+            "SELECT id, user_id, reset_code, reset_expires_at FROM admins WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not admin:
+            return jsonify({"error": "Admin account not found"}), 404
+
+        if not admin["reset_code"] or not admin["reset_expires_at"]:
+            return jsonify({"error": "No OTP request found. Request a new OTP."}), 400
+
+        expires_dt = parse_iso_datetime(admin["reset_expires_at"])
+        if not expires_dt or datetime.utcnow() > expires_dt:
+            return jsonify({"error": "OTP expired. Request a new OTP."}), 400
+
+        if str(otp) != str(admin["reset_code"]):
+            return jsonify({"error": "Invalid OTP code"}), 401
+
+        conn.execute(
+            """
+            UPDATE admins
+            SET password_hash = ?, reset_code = NULL, reset_expires_at = NULL
+            WHERE id = ?
+            """,
+            (hash_password(new_password), admin["id"]),
+        )
+        conn.commit()
+
+    return jsonify({"message": "Password reset successfully."})
+
+
+@app.get("/api/master-admin/admins")
+@admin_required
+def master_admin_list_admins():
+    if g.admin["user_id"] != "ISHU":
+        return jsonify({"error": "Forbidden"}), 403
+
+    with closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, email, is_verified, created_at
+            FROM admins
+            ORDER BY id DESC
+            """,
+        ).fetchall()
+
+    return jsonify(
+        [
+            {
+                "id": row["id"],
+                "userId": row["user_id"],
+                "email": row["email"],
+                "isVerified": bool(row["is_verified"]),
+                "createdAt": normalize_utc_string(row["created_at"]),
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.post("/api/master-admin/admins/<int:admin_id>/reset-password")
+@admin_required
+def master_admin_reset_password(admin_id):
+    if g.admin["user_id"] != "ISHU":
+        return jsonify({"error": "Forbidden"}), 403
+
+    data = request.get_json(force=True)
+    new_password = (data.get("newPassword") or "").strip()
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
+
+    with closing(get_db_connection()) as conn:
+        admin = conn.execute("SELECT id FROM admins WHERE id = ?", (admin_id,)).fetchone()
+        if not admin:
+            return jsonify({"error": "Admin not found"}), 404
+
+        conn.execute(
+            """
+            UPDATE admins
+            SET password_hash = ?, reset_code = NULL, reset_expires_at = NULL
+            WHERE id = ?
+            """,
+            (hash_password(new_password), admin_id),
+        )
+        conn.commit()
+
+    return jsonify({"message": "Admin password updated."})
+
+
+@app.delete("/api/master-admin/admins/<int:admin_id>/account")
+@admin_required
+def master_admin_delete_admin_account(admin_id):
+    if g.admin["user_id"] != "ISHU":
+        return jsonify({"error": "Forbidden"}), 403
+
+    # Prevent locking yourself out.
+    if admin_id == g.admin["id"]:
+        return jsonify({"error": "Cannot delete master admin account"}), 403
+
+    with closing(get_db_connection()) as conn:
+        exists = conn.execute("SELECT id FROM admins WHERE id = ?", (admin_id,)).fetchone()
+        if not exists:
+            return jsonify({"error": "Admin not found"}), 404
+
+        # Delete tests first so related submissions are removed.
+        conn.execute("DELETE FROM tests WHERE admin_id = ?", (admin_id,))
+        conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+        conn.commit()
+
+    return jsonify({"message": "Admin account deleted."})
 
 
 @app.post("/api/admin/change-password")
@@ -328,7 +893,7 @@ def admin_change_password():
             "SELECT password_hash FROM admins WHERE id = ?",
             (g.admin["id"],),
         ).fetchone()
-        if not row or row["password_hash"] != hash_password(current_password):
+        if not row or not verify_password(current_password, row["password_hash"]):
             return jsonify({"error": "Current password is incorrect"}), 401
 
         conn.execute(
@@ -350,6 +915,23 @@ def admin_me():
             "email": g.admin["email"],
         }
     )
+
+
+@app.delete("/api/admin/account")
+@admin_required
+def admin_delete_account():
+    """
+    Deletes the admin and all their tests/results.
+    """
+    admin_id = g.admin["id"]
+    with closing(get_db_connection()) as conn:
+        # Delete tests first so questions/submissions cascade correctly.
+        conn.execute("DELETE FROM tests WHERE admin_id = ?", (admin_id,))
+        # Then delete the admin record.
+        conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
+        conn.commit()
+
+    return jsonify({"message": "Account deleted"})
 
 
 @app.post("/api/tests")
@@ -609,6 +1191,70 @@ def get_results(test_id):
     )
 
 
+@app.get("/api/tests/<int:test_id>/wrong-answers")
+@admin_required
+def get_wrong_answers(test_id):
+    with closing(get_db_connection()) as conn:
+        owner = conn.execute(
+            "SELECT id FROM tests WHERE id = ? AND admin_id = ?",
+            (test_id, g.admin["id"]),
+        ).fetchone()
+        if not owner:
+            return jsonify({"error": "Test not found"}), 404
+
+        questions = conn.execute(
+            """
+            SELECT id, question_text, correct_answer
+            FROM questions
+            WHERE test_id = ?
+            ORDER BY id ASC
+            """,
+            (test_id,),
+        ).fetchall()
+
+        qid_to_number = {row["id"]: idx + 1 for idx, row in enumerate(questions)}
+
+        submissions = conn.execute(
+            """
+            SELECT id, student_name, reg_number, section, answers
+            FROM submissions
+            WHERE test_id = ?
+            ORDER BY submitted_at DESC
+            """,
+            (test_id,),
+        ).fetchall()
+
+    response = []
+    for sub in submissions:
+        try:
+            answers = json.loads(sub["answers"])
+        except Exception:
+            answers = {}
+
+        wrong_questions = []
+        for q in questions:
+            selected = str(answers.get(str(q["id"]), "")).upper()
+            if selected != str(q["correct_answer"]).upper():
+                wrong_questions.append(
+                    {
+                        "questionNumber": qid_to_number[q["id"]],
+                        "questionText": q["question_text"],
+                    }
+                )
+
+        response.append(
+            {
+                "submissionId": sub["id"],
+                "studentName": sub["student_name"],
+                "regNumber": sub["reg_number"],
+                "section": sub["section"],
+                "wrongQuestions": wrong_questions,
+            }
+        )
+
+    return jsonify(response)
+
+
 @app.get("/api/tests/<int:test_id>/results/export/csv")
 @admin_required
 def export_results_csv(test_id):
@@ -660,6 +1306,113 @@ def export_results_csv(test_id):
     response.headers["Content-Type"] = "text/csv"
     response.headers["Content-Disposition"] = f"attachment; filename=test_{test_id}_results.csv"
     return response
+
+
+@app.get("/api/tests/<int:test_id>/results/export/xlsx")
+@admin_required
+def export_results_xlsx(test_id):
+    with closing(get_db_connection()) as conn:
+        owner = conn.execute(
+            "SELECT id FROM tests WHERE id = ? AND admin_id = ?",
+            (test_id, g.admin["id"]),
+        ).fetchone()
+        if not owner:
+            return jsonify({"error": "Test not found"}), 404
+
+        test_questions = conn.execute(
+            """
+            SELECT id, question_text, correct_answer
+            FROM questions
+            WHERE test_id = ?
+            ORDER BY id ASC
+            """,
+            (test_id,),
+        ).fetchall()
+        qid_to_number = {row["id"]: idx + 1 for idx, row in enumerate(test_questions)}
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                student_name,
+                reg_number,
+                section,
+                score,
+                tab_switch_count,
+                time_taken,
+                submitted_at,
+                answers
+            FROM submissions
+            WHERE test_id = ?
+            ORDER BY submitted_at DESC
+            """,
+            (test_id,),
+        ).fetchall()
+
+    wb = openpyxl.Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    ws_summary.append(
+        [
+            "Name",
+            "Registration Number",
+            "Section",
+            "Score",
+            "Tab Switch Count",
+            "Time Taken (seconds)",
+            "Submitted At (UTC)",
+        ]
+    )
+
+    for row in rows:
+        ws_summary.append(
+            [
+                row["student_name"],
+                row["reg_number"],
+                row["section"],
+                row["score"],
+                row["tab_switch_count"],
+                row["time_taken"],
+                normalize_utc_string(row["submitted_at"]),
+            ]
+        )
+
+    ws_wrong = wb.create_sheet("Wrong Answers")
+    ws_wrong.append(
+        [
+            "Name",
+            "Registration Number",
+            "Section",
+            "Question No.",
+            "Question Text",
+        ]
+    )
+
+    for row in rows:
+        try:
+            answers = json.loads(row["answers"]) if row["answers"] else {}
+        except Exception:
+            answers = {}
+
+        wrong_questions = []
+        for q in test_questions:
+            selected = str(answers.get(str(q["id"]), "")).upper()
+            if selected != str(q["correct_answer"]).upper():
+                wrong_questions.append((qid_to_number[q["id"]], q["question_text"]))
+
+        for q_no, q_text in wrong_questions:
+            ws_wrong.append([row["student_name"], row["reg_number"], row["section"], q_no, q_text])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    return send_file(
+        buffer,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"test_{test_id}_results_report.xlsx",
+    )
 
 
 @app.get("/api/submissions/<int:submission_id>/pdf")
@@ -721,9 +1474,29 @@ def export_results_pdf(test_id):
         if not test:
             return jsonify({"error": "Test not found"}), 404
 
+        questions = conn.execute(
+            """
+            SELECT id, question_text, correct_answer
+            FROM questions
+            WHERE test_id = ?
+            ORDER BY id ASC
+            """,
+            (test_id,),
+        ).fetchall()
+        qid_to_number = {row["id"]: idx + 1 for idx, row in enumerate(questions)}
+
         rows = conn.execute(
             """
-            SELECT student_name, reg_number, section, score, tab_switch_count, time_taken, submitted_at
+            SELECT
+                id,
+                student_name,
+                reg_number,
+                section,
+                score,
+                tab_switch_count,
+                time_taken,
+                submitted_at,
+                answers
             FROM submissions
             WHERE test_id = ?
             ORDER BY submitted_at DESC
@@ -786,6 +1559,61 @@ def export_results_pdf(test_id):
         for i, value in enumerate(values):
             pdf.drawString(x_positions[i], y, value)
         y -= 11
+
+    # Wrong answers section (name + question number + question text they got wrong)
+    pdf.setFont("Helvetica-Bold", 12)
+    if y < 200:
+        pdf.showPage()
+        y = 810
+    pdf.drawString(40, y, "Wrong Answers (Per Candidate)")
+    y -= 16
+    pdf.setFont("Helvetica", 9)
+
+    any_wrong = False
+    for row in rows:
+        try:
+            answers = json.loads(row["answers"]) if row["answers"] else {}
+        except Exception:
+            answers = {}
+
+        wrong_questions = []
+        for q in questions:
+            selected = str(answers.get(str(q["id"]), "")).upper()
+            if selected != str(q["correct_answer"]).upper():
+                wrong_questions.append((qid_to_number[q["id"]], q["question_text"]))
+
+        if not wrong_questions:
+            continue
+        any_wrong = True
+
+        if y < 70:
+            pdf.showPage()
+            y = 810
+            pdf.setFont("Helvetica", 9)
+
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(40, y, f"{row['student_name']} ({row['reg_number']})")
+        y -= 12
+        pdf.setFont("Helvetica", 9)
+
+        for q_no, q_text in wrong_questions:
+            line = f"Q{q_no}: {q_text}"
+            wrapped = textwrap.wrap(line, width=95) or [line]
+            for wline in wrapped:
+                if y < 50:
+                    pdf.showPage()
+                    y = 810
+                    pdf.setFont("Helvetica", 9)
+                pdf.drawString(50, y, wline)
+                y -= 11
+
+        y -= 6
+
+    if not any_wrong:
+        if y < 80:
+            pdf.showPage()
+            y = 810
+        pdf.drawString(40, y, "No wrong answers found for any candidate.")
 
     pdf.showPage()
     pdf.save()

@@ -46,9 +46,6 @@ function AdminDashboardPage() {
       <Toast message={toast.message} type={toast.type} onClose={() => setToast({ message: '', type: 'success' })} />
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-bold">Admin Dashboard</h1>
-        <Link to="/admin/create-test" className="rounded-lg bg-slate-900 px-4 py-2 text-white">
-          Create Test
-        </Link>
       </div>
 
       {error ? <p className="mb-4 rounded bg-red-100 p-3 text-red-700">{error}</p> : null}

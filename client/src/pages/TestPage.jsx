@@ -21,6 +21,26 @@ function TestPage() {
   const [currentQuestionId, setCurrentQuestionId] = useState(null)
   const submittedRef = useRef(false)
   const leftWindowRef = useRef(false)
+  const answersRef = useRef(answers)
+  const tabSwitchCountRef = useRef(tabSwitchCount)
+  const visitedQuestionsRef = useRef(visitedQuestions)
+  const currentQuestionIdRef = useRef(currentQuestionId)
+
+  useEffect(() => {
+    answersRef.current = answers
+  }, [answers])
+
+  useEffect(() => {
+    tabSwitchCountRef.current = tabSwitchCount
+  }, [tabSwitchCount])
+
+  useEffect(() => {
+    visitedQuestionsRef.current = visitedQuestions
+  }, [visitedQuestions])
+
+  useEffect(() => {
+    currentQuestionIdRef.current = currentQuestionId
+  }, [currentQuestionId])
 
   useEffect(() => {
     async function loadTest() {
@@ -38,14 +58,25 @@ function TestPage() {
         const data = await api.getTest(testId)
         setTestData(data)
         setAnswers(session.answers || {})
+        if (session.visitedQuestions && typeof session.visitedQuestions === 'object') {
+          setVisitedQuestions(session.visitedQuestions)
+        }
+        if (session.lastQuestionId) {
+          setCurrentQuestionId(session.lastQuestionId)
+        }
 
         const total = data.duration * 60
         const elapsed = Math.floor((Date.now() - (session.startedAt || Date.now())) / 1000)
         setRemainingSeconds(Math.max(total - elapsed, 0))
         setTabSwitchCount(session.tabSwitchCount || 0)
         if (data.questions.length > 0) {
-          setCurrentQuestionId(data.questions[0].id)
-          setVisitedQuestions({ [data.questions[0].id]: true })
+          const firstId = data.questions[0].id
+          if (!session.lastQuestionId) {
+            setCurrentQuestionId(firstId)
+          }
+          if (!session.visitedQuestions || typeof session.visitedQuestions !== 'object') {
+            setVisitedQuestions({ [firstId]: true })
+          }
         }
       } catch (err) {
         setError(err.message)
@@ -53,6 +84,23 @@ function TestPage() {
     }
     loadTest()
   }, [testId, navigate])
+
+  // Auto-save session every few seconds so refresh never loses progress.
+  useEffect(() => {
+    if (!testData) return
+    const intervalId = setInterval(() => {
+      const session = loadSession(testId)
+      if (!session || session.submitted) return
+      saveSession(testId, {
+        ...session,
+        answers: answersRef.current,
+        tabSwitchCount: tabSwitchCountRef.current,
+        visitedQuestions: visitedQuestionsRef.current,
+        lastQuestionId: currentQuestionIdRef.current,
+      })
+    }, 3000)
+    return () => clearInterval(intervalId)
+  }, [testData, testId])
 
   useEffect(() => {
     if (!testData || submittedRef.current) return
@@ -100,7 +148,13 @@ function TestPage() {
   useEffect(() => {
     const session = loadSession(testId)
     if (!session) return
-    saveSession(testId, { ...session, answers, tabSwitchCount })
+    saveSession(testId, {
+      ...session,
+      answers,
+      tabSwitchCount,
+      visitedQuestions,
+      lastQuestionId: currentQuestionId,
+    })
   }, [answers, tabSwitchCount, testId])
 
   const handleAnswerChange = (questionId, selected) => {
@@ -159,9 +213,16 @@ function TestPage() {
   return (
     <div className="mx-auto max-w-4xl p-4 sm:p-6">
       <Toast message={toast.message} type={toast.type} onClose={() => setToast({ message: '', type: 'success' })} />
-      <div className="sticky top-0 z-10 mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-slate-100/90 p-2 backdrop-blur">
-        <h1 className="text-2xl font-bold">{testData.name}</h1>
-        <Timer remainingSeconds={remainingSeconds} />
+      <div className="sticky top-0 z-10 mb-4 rounded-lg bg-slate-100/90 p-3 backdrop-blur shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
+          <h1 className="text-xl font-bold text-slate-900">Online Test</h1>
+          <Timer remainingSeconds={remainingSeconds} />
+        </div>
+        <ul className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 list-none">
+          <li>📌 Answer all questions before time runs out</li>
+          <li>🚫 Do not switch tabs — activity is monitored</li>
+          <li>✅ Green = answered &nbsp;|&nbsp; 🟡 Yellow = visited but skipped</li>
+        </ul>
       </div>
 
       <WarningPopup />
