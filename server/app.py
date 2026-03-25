@@ -676,19 +676,37 @@ def admin_login():
 
 @app.post("/api/admin/forgot-password")
 def admin_forgot_password():
-    return jsonify({"error": "Use /forgot-password/request-otp after answering security questions."}), 400
+    return jsonify({"error": "Use /forgot-password/reset-password to reset your password."}), 400
 
 
 @app.post("/api/admin/forgot-password/request-otp")
 def admin_forgot_password_request_otp():
+    # Kept for backward compatibility — redirect to direct reset.
+    return jsonify({"error": "OTP flow is disabled. Use /forgot-password/reset-password."}), 410
+
+
+@app.post("/api/admin/forgot-password/confirm-otp")
+def admin_forgot_password_confirm_otp():
+    # Kept for backward compatibility — redirect to direct reset.
+    return jsonify({"error": "OTP flow is disabled. Use /forgot-password/reset-password."}), 410
+
+
+@app.post("/api/admin/forgot-password/reset-password")
+def admin_forgot_password_reset():
+    """Direct reset: verify security answers then set new password. No OTP needed."""
     data = request.get_json(force=True)
     identifier = (data.get("userId") or data.get("identifier") or "").strip()
     dob = normalize_birth_date(data.get("dob"))
     birth_city = normalize_answer_text(data.get("birthCity"))
     school_name = normalize_answer_text(data.get("schoolName"))
+    new_password = (data.get("newPassword") or "").strip()
 
     if not identifier:
         return jsonify({"error": "User ID is required"}), 400
+    if not dob or not birth_city or not school_name:
+        return jsonify({"error": "Date of birth, city of birth, and school name are required"}), 400
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
 
     identifier_is_email = "@" in identifier
     user_id = identifier if not identifier_is_email else identifier.split("@", 1)[0]
@@ -696,7 +714,7 @@ def admin_forgot_password_request_otp():
     with closing(get_db_connection()) as conn:
         admin = conn.execute(
             """
-            SELECT id, user_id, email, dob_answer_hash, birth_city_answer_hash, school_name_answer_hash
+            SELECT id, user_id, dob_answer_hash, birth_city_answer_hash, school_name_answer_hash
             FROM admins
             WHERE user_id = ?
             """,
@@ -706,82 +724,15 @@ def admin_forgot_password_request_otp():
         if not admin:
             return jsonify({"error": "Admin account not found"}), 404
 
-        # Master admin bypass: password reset can be triggered without security answers.
-        if admin["user_id"] != "ISHU":
-            if not dob or not birth_city or not school_name:
-                return jsonify({"error": "DOB, city of birth, and school name are required"}), 400
-            if not (admin["dob_answer_hash"] and admin["birth_city_answer_hash"] and admin["school_name_answer_hash"]):
-                return jsonify({"error": "Security answers not set for this account"}), 403
+        if not (admin["dob_answer_hash"] and admin["birth_city_answer_hash"] and admin["school_name_answer_hash"]):
+            return jsonify({"error": "Security answers not set for this account"}), 403
 
-            if (
-                hash_security_answer(dob) != admin["dob_answer_hash"]
-                or hash_security_answer(birth_city) != admin["birth_city_answer_hash"]
-                or hash_security_answer(school_name) != admin["school_name_answer_hash"]
-            ):
-                return jsonify({"error": "Security answers do not match"}), 401
-
-        if otp_rate_limited(admin["email"], purpose="forgot-password-request"):
-            return jsonify({"error": "Too many OTP requests. Please wait and try again."}), 429
-
-        otp = otp_code(6)
-        expires_at = otp_expires_utc(minutes=10)
-
-        conn.execute(
-            """
-            UPDATE admins
-            SET reset_code = ?, reset_expires_at = ?
-            WHERE id = ?
-            """,
-            (otp, expires_at, admin["id"]),
-        )
-        conn.commit()
-
-        smtp_dev_return = os.getenv("DEV_RETURN_OTP", "false").strip().lower() in {"1", "true", "yes"}
-        if smtp_dev_return:
-            return jsonify({"message": "OTP generated (dev mode).", "otp": otp})
-
-        send_email_otp(
-            to_email=admin["email"],
-            subject="Admin password reset OTP",
-            body=f"Your OTP code is: {otp}\nThis OTP expires in 10 minutes.",
-        )
-        return jsonify({"message": "OTP sent to your email address."})
-
-
-@app.post("/api/admin/forgot-password/confirm-otp")
-def admin_forgot_password_confirm_otp():
-    data = request.get_json(force=True)
-    identifier = (data.get("userId") or data.get("identifier") or "").strip()
-    otp = (data.get("otp") or data.get("code") or "").strip()
-    new_password = (data.get("newPassword") or "").strip()
-
-    if not identifier:
-        return jsonify({"error": "User ID is required"}), 400
-    if not otp:
-        return jsonify({"error": "OTP code is required"}), 400
-    if not new_password or len(new_password) < 6:
-        return jsonify({"error": "New password must be at least 6 characters"}), 400
-
-    identifier_is_email = "@" in identifier
-    user_id = identifier if not identifier_is_email else identifier.split("@", 1)[0]
-
-    with closing(get_db_connection()) as conn:
-        admin = conn.execute(
-            "SELECT id, user_id, reset_code, reset_expires_at FROM admins WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if not admin:
-            return jsonify({"error": "Admin account not found"}), 404
-
-        if not admin["reset_code"] or not admin["reset_expires_at"]:
-            return jsonify({"error": "No OTP request found. Request a new OTP."}), 400
-
-        expires_dt = parse_iso_datetime(admin["reset_expires_at"])
-        if not expires_dt or datetime.utcnow() > expires_dt:
-            return jsonify({"error": "OTP expired. Request a new OTP."}), 400
-
-        if str(otp) != str(admin["reset_code"]):
-            return jsonify({"error": "Invalid OTP code"}), 401
+        if (
+            hash_security_answer(dob) != admin["dob_answer_hash"]
+            or hash_security_answer(birth_city) != admin["birth_city_answer_hash"]
+            or hash_security_answer(school_name) != admin["school_name_answer_hash"]
+        ):
+            return jsonify({"error": "Security answers do not match. Please check your details."}), 401
 
         conn.execute(
             """

@@ -55,6 +55,8 @@ export const api = {
     request('/api/admin/login', { method: 'POST', body: JSON.stringify(data) }),
   forgotPassword: (data) =>
     request('/api/admin/forgot-password', { method: 'POST', body: JSON.stringify(data) }),
+  resetPassword: (data) =>
+    request('/api/admin/forgot-password/reset-password', { method: 'POST', body: JSON.stringify(data) }),
   requestPasswordResetOtp: (data) =>
     request('/api/admin/forgot-password/request-otp', { method: 'POST', body: JSON.stringify(data) }),
   confirmPasswordResetOtp: (data) =>
