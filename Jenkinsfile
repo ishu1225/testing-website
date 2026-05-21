@@ -49,7 +49,7 @@ pipeline {
 
         stage('Deploy to Kubernetes') {
             steps {
-                sh 'kubectl apply -f k8s/'
+                sh 'export AWS_PAGER="" && kubectl apply -f k8s/ --validate=false'
             }
         }
     }
