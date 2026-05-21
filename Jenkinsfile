@@ -52,9 +52,12 @@ pipeline {
                 sh '''
                     export AWS_PAGER=""
                     kubectl apply -f k8s/ --validate=false
+                    kubectl apply -f k8s/monitoring/ --validate=false
                     kubectl rollout restart deployment/frontend deployment/backend
                     kubectl rollout status deployment/frontend --timeout=180s
                     kubectl rollout status deployment/backend --timeout=180s
+                    kubectl rollout status deployment/prometheus -n monitoring --timeout=180s || true
+                    kubectl rollout status deployment/grafana -n monitoring --timeout=180s || true
                 '''
             }
         }

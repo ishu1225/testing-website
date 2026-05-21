@@ -125,6 +125,35 @@ Frontend runs on `http://localhost:5173` by default.
 
 `vercel.json` is included for SPA route rewrites.
 
+## Monitoring (Prometheus + Grafana)
+
+After deploy, Grafana is exposed with a LoadBalancer in the `monitoring` namespace.
+
+1. Get the Grafana URL:
+
+```bash
+kubectl get svc -n monitoring grafana
+```
+
+2. Open `http://<EXTERNAL-IP>` in your browser.
+
+3. Login (change these in `k8s/monitoring/grafana-secret.yaml` before production):
+
+- **Username:** `admin`
+- **Password:** `changeme`
+
+4. Open the preloaded **MCQ Platform** dashboard (backend health, request rate, status codes).
+
+Prometheus runs inside the cluster at `http://prometheus.monitoring.svc.cluster.local:9090` (Grafana uses this datasource). The Flask backend exposes metrics at `/metrics`.
+
+Optional: port-forward Prometheus UI locally:
+
+```bash
+kubectl port-forward -n monitoring svc/prometheus 9090:9090
+```
+
+Then open `http://localhost:9090`.
+
 ## Deploy on Kubernetes (EKS)
 
 The frontend is served by nginx in the frontend pod. API calls from the **browser** must use the same origin as the UI (the LoadBalancer URL), not `http://backend-service:5000` (that hostname only resolves inside the cluster).
