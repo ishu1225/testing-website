@@ -49,7 +49,13 @@ pipeline {
 
         stage('Deploy to Kubernetes') {
             steps {
-                sh 'export AWS_PAGER="" && kubectl apply -f k8s/ --validate=false'
+                sh '''
+                    export AWS_PAGER=""
+                    kubectl apply -f k8s/ --validate=false
+                    kubectl rollout restart deployment/frontend deployment/backend
+                    kubectl rollout status deployment/frontend --timeout=180s
+                    kubectl rollout status deployment/backend --timeout=180s
+                '''
             }
         }
     }

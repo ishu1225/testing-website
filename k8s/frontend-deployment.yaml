@@ -20,6 +20,7 @@ spec:
       containers:
       - name: frontend
         image: ishu1225/mcq-frontend:latest
+        imagePullPolicy: Always
 
         ports:
         - containerPort: 80

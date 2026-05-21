@@ -20,6 +20,7 @@ spec:
       containers:
       - name: backend
         image: ishu1225/mcq-backend:latest
+        imagePullPolicy: Always
 
         ports:
         - containerPort: 5000
