@@ -11,13 +11,13 @@ pipeline {
 
         stage('Build Frontend Image') {
             steps {
-                sh 'docker build -t ishu1225/mcq-frontend:latest ./client'
+                sh 'docker build -t ishu1225/mcq-frontend:latest -f client/Dockerfile client'
             }
         }
 
         stage('Build Backend Image') {
             steps {
-                sh 'docker build -t ishu1225/mcq-backend:latest ./server'
+                sh 'docker build -t ishu1225/mcq-backend:latest -f server/Dockerfile server'
             }
         }
 
