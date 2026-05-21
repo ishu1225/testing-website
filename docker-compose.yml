@@ -6,6 +6,10 @@ services:
     build: ./server
     ports:
       - "5000:5000"
+    networks:
+      default:
+        aliases:
+          - backend-service
 
   frontend:
     build: ./client

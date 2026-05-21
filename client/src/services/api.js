@@ -1,4 +1,5 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000'
+// Empty base URL = same-origin requests (nginx proxies /api to backend in K8s/Docker).
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:5000'
 import { getAdminToken } from '../utils/adminAuth'
 
 async function request(path, options = {}) {

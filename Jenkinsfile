@@ -11,7 +11,7 @@ pipeline {
 
         stage('Build Frontend Image') {
             steps {
-                sh 'docker build -t ishu1225/mcq-frontend:latest -f client/Dockerfile client'
+                sh 'docker build --build-arg VITE_API_BASE_URL= -t ishu1225/mcq-frontend:latest -f client/Dockerfile client'
             }
         }
 

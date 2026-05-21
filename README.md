@@ -125,6 +125,24 @@ Frontend runs on `http://localhost:5173` by default.
 
 `vercel.json` is included for SPA route rewrites.
 
+## Deploy on Kubernetes (EKS)
+
+The frontend is served by nginx in the frontend pod. API calls from the **browser** must use the same origin as the UI (the LoadBalancer URL), not `http://backend-service:5000` (that hostname only resolves inside the cluster).
+
+Flow:
+
+```text
+Browser → frontend LoadBalancer → nginx → /api/* → backend-service:5000
+```
+
+The production frontend image is built with an empty `VITE_API_BASE_URL` so `fetch('/api/...')` hits nginx, which proxies to the backend service. Jenkins passes `--build-arg VITE_API_BASE_URL=` when building the frontend image.
+
+Verify from a frontend pod:
+
+```bash
+kubectl exec -it deployment/frontend -- wget -qO- http://backend-service:5000/api/health
+```
+
 ## Notes
 
 - Keep backend and frontend URLs aligned through env variables.
