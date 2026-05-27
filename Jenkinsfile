@@ -49,17 +49,44 @@ pipeline {
 
         stage('Deploy to Kubernetes') {
             steps {
-                sh '''
-                    export AWS_PAGER=""
-                    kubectl apply -f k8s/ --validate=false
-                    kubectl apply -f k8s/monitoring/ --validate=false
-                    kubectl rollout restart deployment/frontend deployment/backend
-                    kubectl rollout status deployment/frontend --timeout=180s
-                    kubectl rollout status deployment/backend --timeout=180s
-                    kubectl rollout status deployment/prometheus -n monitoring --timeout=180s || true
-                    kubectl rollout status deployment/grafana -n monitoring --timeout=180s || true
-                '''
+                script {
+                    // Check if kubectl can reach the EKS cluster before attempting deploy.
+                    // Jenkins runs inside Docker on a local Windows machine and does NOT have
+                    // AWS credentials or a kubeconfig mounted, so the deploy is skipped here.
+                    // Run: kubectl rollout restart deployment/backend deployment/frontend
+                    // from your local machine after each push to apply the new images.
+                    def reachable = sh(
+                        script: 'kubectl cluster-info --request-timeout=5s > /dev/null 2>&1',
+                        returnStatus: true
+                    ) == 0
+
+                    if (reachable) {
+                        sh '''
+                            export AWS_PAGER=""
+                            kubectl apply -f k8s/ --validate=false
+                            kubectl apply -f k8s/monitoring/ --validate=false
+                            kubectl rollout restart deployment/frontend deployment/backend
+                            kubectl rollout status deployment/frontend --timeout=180s
+                            kubectl rollout status deployment/backend --timeout=180s
+                            kubectl rollout status deployment/prometheus -n monitoring --timeout=180s || true
+                            kubectl rollout status deployment/grafana -n monitoring --timeout=180s || true
+                        '''
+                    } else {
+                        echo '⚠️  WARNING: Cannot reach EKS cluster from Jenkins (no kubeconfig/AWS creds mounted).'
+                        echo '✅  Images pushed to Docker Hub successfully.'
+                        echo '👉  To deploy: run  kubectl rollout restart deployment/backend deployment/frontend  from your local machine.'
+                    }
+                }
             }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline finished: images built and pushed to Docker Hub.'
+        }
+        failure {
+            echo '❌ Pipeline failed — check stage logs above.'
         }
     }
 }
