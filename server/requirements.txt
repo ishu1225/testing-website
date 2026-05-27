@@ -5,4 +5,5 @@ gunicorn
 openpyxl
 bcrypt
 python-dotenv
+prometheus-flask-exporter
 prometheus-client

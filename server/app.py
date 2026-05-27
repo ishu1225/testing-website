@@ -21,7 +21,7 @@ from flask_cors import CORS
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from dotenv import load_dotenv
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from prometheus_flask_exporter import PrometheusMetrics
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,18 +31,15 @@ DB_PATH = os.path.join(BASE_DIR, "database.db")
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": os.getenv("CORS_ORIGIN", "*")}})
 
-HTTP_REQUESTS = Counter(
-    "http_requests_total",
-    "Total HTTP requests",
-    ["method", "endpoint", "status"],
-)
-
-
-@app.after_request
-def record_metrics(response):
-    if request.path != "/metrics":
-        HTTP_REQUESTS.labels(request.method, request.path, response.status_code).inc()
-    return response
+# ----- Prometheus monitoring -----
+# PrometheusMetrics automatically:
+#   - exposes /metrics (Prometheus-format)
+#   - tracks http_request_duration_seconds (latency histograms per endpoint)
+#   - tracks flask_http_request_total (request counts by method/path/status)
+#   - exposes process_cpu_seconds_total, process_virtual_memory_bytes, etc.
+# group_by_endpoint=True gives per-endpoint metrics instead of per-path.
+# Gunicorn multiprocess: set PROMETHEUS_MULTIPROC_DIR env var (done in Dockerfile).
+metrics = PrometheusMetrics(app, group_by_endpoint=True)
 
 
 def get_db_connection():
@@ -568,9 +565,7 @@ def health():
     return jsonify({"status": "ok", "timestamp": int(time.time())})
 
 
-@app.get("/metrics")
-def metrics():
-    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+# /metrics route is registered automatically by PrometheusMetrics above.
 
 
 @app.post("/api/admin/register")
