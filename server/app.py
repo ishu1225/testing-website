@@ -305,7 +305,7 @@ def init_db():
             placeholder_email = f"{MASTER_ADMIN_USER_ID}@local.test"
             conn.execute(
                 """
-                INSERT INTO admins (
+                INSERT OR IGNORE INTO admins (
                     user_id,
                     email,
                     password_hash,
